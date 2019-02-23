@@ -678,19 +678,6 @@ dev> ./emr-ctl jar-version j-394OWCGLKHED3
 Connection to ec2-47-87-17-126.us-east-1.compute.amazonaws.com closed.
 ```
 
-To publish changes to s3 (and optionally to a cluster), use the `publish-jar`
-command:
-
-```bash
-dev> ./emr-ctl publish-jar target/scala-2.11/2.11/flinkydink-2.1.17.jar j-394OWCGLKHED3
-```
-
-```
-upload: target/scala-2.11/flinkydink-2.1.17.jar to s3://<s3-bucket>/jars/flinkydink-2.1.17.jar
-download: s3://<s3-bucket>/jars/flinkydink-2.1.17.jar to ./flinkydink-2.1.17.jar
-Connection to ec2-47-87-17-126.us-east-1.compute.amazonaws.com closed.
-```
-
 After building a new version of the jar, you can publish
 it to s3 (and to a running cluster if you provide the cluster id):
 

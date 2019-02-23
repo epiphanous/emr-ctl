@@ -537,7 +537,7 @@ dev> ./emr-ctl cancel j-394OWCGLKHED3 -s 0711de4ca14ebc7ba7f6ee59f0b52af2
 ```
 
 ```
-flink cancel -s s3://<s3-bucket>/v2/flink-savepoints/staging/SmoothTelemetryJob/20180822-202536 5449dc71489626ef497886dbec513010
+flink cancel -s s3://<s3-bucket>/v2/flink-savepoints/staging/MyJob1/20180822-202536 5449dc71489626ef497886dbec513010
 Using the result of 'hadoop classpath' to augment the Hadoop classpath: /etc/hadoop/conf:/usr/lib/hadoop/lib/*:/usr/lib/hadoop/.//*:/usr/lib/hadoop-hdfs/./:/usr/lib/hadoop-hdfs/lib/*:/usr/lib/hadoop-hdfs/.//*:/usr/lib/hadoop-yarn/lib/*:/usr/lib/hadoop-yarn/.//*:/usr/lib/hadoop-mapreduce/lib/*:/usr/lib/hadoop-mapreduce/.//*::/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/lib/*:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*
 SLF4J: Class path contains multiple SLF4J bindings.
 SLF4J: Found binding in [jar:file:/usr/lib/flink-1.6.0/lib/slf4j-log4j12-1.7.7.jar!/org/slf4j/impl/StaticLoggerBinder.class]

@@ -1,0 +1,758 @@
+#!/usr/bin/env bash
+
+declare -r USER
+export AWS_PROFILE
+
+RUNNER="runner-???"
+RUNNER_VERSION="v?.??"
+
+source ./colors.sh
+
+danger() { 
+  echo -e "${BRED}$*${RCOL}" 
+}
+
+warn()   { 
+  echo -e "${BYEL}$*${RCOL}" 
+}
+
+notice() { 
+  echo -e "${BBLU}$*${RCOL}" 
+}
+
+alert()  { 
+  echo -e "${BCYA}$*${RCOL}" 
+}
+
+ON_EC2=yes
+PLATFORM=EMR
+
+# warning about setting the aws profile
+type ec2-metadata >/dev/null 2>&1 || {
+  ON_EC2=no
+  PLATFORM=DEV
+  [ "$AWS_PROFILE" = "" ] && {
+    warn "WARN: might want to set the ${GRE}AWS_PROFILE${BYEL} environment variable to make sure aws commands work"
+  }
+}
+
+type jq >/dev/null 2>&1 || {
+  echo
+  danger "ERROR: This script requires you have jq installed."
+  danger "ERROR: Please ensure its available on the path and try again."
+  echo
+  exit 1
+}
+
+type aws >/dev/null 2>&1 || {
+  echo
+  danger "ERROR: This script requires you have aws cli installed."
+  danger "ERROR: Please ensure its available on the path and try again."
+  echo
+  exit 1
+}
+
+export AWS_DEFAULT_REGION=us-east-1
+
+PROGRAM=$(basename $0)
+MD5_SUM=md5sum
+type md5 >/dev/null 2>&1 && MD5_SUM=md5
+
+VERSION=$(${MD5_SUM} $0)
+
+S3_BUCKET="s3://emr-ctl-artifacts"
+TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp/}${PROGRAM}.XXXXXXXXXXXX")
+TAGS_ENV_FILE="$TEMP_DIR/TAGS_ENV"
+ARGS_FILE="$TEMP_DIR/ARGS"
+
+TAGS="{}"
+DEFAULT_TAG_FLINK_VERSION="1.7.2"
+DEFAULT_TAG_RELEASE_LABEL="emr-5.21.0"
+DEFAULT_TAG_INSTANCE_COUNT=3
+DEFAULT_TAG_INSTANCE_TYPE="m5.2xlarge"
+DEFAULT_TAG_JOB_MANAGER_MEMORY=4096
+DEFAULT_TAG_TASK_MANAGER_MEMORY=4096
+DEFAULT_TAG_SAVEPOINT_BASE=${S3_BUCKET}/flink-savepoints/default
+MISSING_TAG="MISSING"
+
+# pull in custom configuration
+source ./.env
+
+ensure_local() {
+  cmd=$1
+  [ "$ON_EC2" != "yes" ] || {
+    [ "$cmd" = "" ] || warn "${BRED}${cmd}${BYEL} can't be run inside an emr cluster"
+    return 1
+  }
+}
+
+ensure_ec2() {
+  cmd=$1
+  [ "$ON_EC2" = "yes" ] || {
+    [ "$cmd" = "" ] || warn "${BRED}${cmd}${BYEL} must be run inside an emr cluster"
+    return 1
+  }
+}
+
+get_yid() {
+  yProps="/tmp/.yarn-properties-$USER"
+  [ -r ${yProps} ] && grep applicationID= ${yProps} | awk -F= '{print $2}' || yarn application -list | grep RUNNING | awk '{print $1}' | grep -v Total
+}
+
+get_num_tm() {
+  yarn node -list 2>/dev/null | grep RUNNING | wc -l
+}
+
+get_tm_slots() {
+  ySiteXml="/etc/hadoop/conf/yarn-site.xml"
+  grep -A1 yarn.nodemanager.resource.cpu-vcores ${ySiteXml} | tail -1 | sed -e 's/<\/\?value>//g' -e 's/ *//g'
+}
+
+get_tag() {
+  tag="$(echo ${TAGS} | jq -r '.["'$1'"]')"
+  [ "$tag" = "null" ] && echo $2 || echo ${tag}
+}
+
+get_env() {
+  get_tag ENV ${MISSING_TAG}
+}
+
+get_s3_jobs_json() {
+  env=$1
+  job=$2
+  aws s3 cp "$(get_s3_bucket)/jobs/$env/$job.json" "$TEMP_DIR" >/dev/null 2>&1 && {
+    result=$(cat "$TEMP_DIR/$job.json" | jq -c .)
+    rm -f "$TEMP_DIR/$job.json"
+    echo "$result"
+  }
+}
+
+get_default_tags() {
+  env=$1
+  get_s3_jobs_json "$env" defaults || echo '{"env":"'"$env"'"}'
+}
+
+merge_tags() {
+  default_tags=$(expand_default_tags $1)
+  other_tags=${2:-'{\}'}
+  TAGS=$(echo "[$default_tags, $other_tags]" | jq -c '.[0] * .[1]')
+}
+
+get_flink_version() {
+  get_tag FLINK_VERSION ${DEFAULT_TAG_FLINK_VERSION}
+}
+
+get_s3_bucket() {
+  echo ${S3_BUCKET}
+}
+
+get_jm_memory() {
+  get_tag JOB_MANAGER_MEMORY ${DEFAULT_TAG_JOB_MANAGER_MEMORY}
+}
+
+get_tm_memory() {
+  get_tag TASK_MANAGER_MEMORY ${DEFAULT_TAG_TASK_MANAGER_MEMORY}
+}
+
+get_cluster_name() {
+  get_tag CLUSTER_NAME $(get_default_cluster_name)
+}
+
+get_release_label() {
+  get_tag RELEASE_LABEL ${DEFAULT_TAG_RELEASE_LABEL}
+}
+
+get_instance_count() {
+  get_tag INSTANCE_COUNT ${DEFAULT_TAG_INSTANCE_COUNT}
+}
+
+get_instance_type() {
+  get_tag INSTANCE_TYPE ${DEFAULT_TAG_INSTANCE_TYPE}
+}
+
+get_savepoint_base() {
+  get_tag SAVEPOINT_BASE ${DEFAULT_TAG_SAVEPOINT_BASE}
+}
+
+get_runner_jar() {
+  echo "${RUNNER}-assembly-$(get_runner_version).jar"
+}
+
+get_subnet() {
+  get_tag SUBNET ${MISSING_TAG}
+}
+
+get_log_uri() {
+  get_tag LOG_URI "$(get_s3_bucket)/logs/$(get_cluster_name)"
+}
+
+get_default_cluster_name() {
+  echo "${RUNNER}-$(get_env)"
+}
+
+get_running_flink_version() {
+  echo $(ls /usr/lib/flink/lib/flink-dist_* | awk -F- '{print $3}' | sed -e 's/\.jar$//' || echo "none")
+}
+
+get_flink_dashboard() {
+  yarn application -appStates RUNNING  -list 2>/dev/null | grep UNDEFINED | tr '\t' \| | awk -F\| '{print $9}'
+}
+
+get_job_name_by_id() {
+  jid=$1
+  curl -s "$(get_flink_dashboard)/jobs/overview" | jq -r '.jobs[] | select(.jid == "'$jid'") | .name'
+}
+
+get_savepoint_parent_dir() {
+  job_name=$1
+  base=$(get_savepoint_base)
+  echo "$base/$job_name"
+}
+
+get_savepoint_id_list() {
+  job_name=$1
+  parent_dir=$(get_savepoint_parent_dir $job_name)
+  prefix_pattern=$(echo $parent_dir | cut -d '/' -f 4- | sed -e 's/\//\\\//g')
+
+  aws s3 ls $parent_dir --recursive --page-size 2000 | grep _metadata | awk '{print $4}' | \
+    sed -e 's/\/_metadata$//' -e 's/'$prefix_pattern'//' | sed -e 's/^\///'
+}
+
+get_latest_savepoint_dir() {
+  job_name=$1
+  parent_dir=$(get_savepoint_parent_dir $job_name)
+  latest=$(get_savepoint_id_list $job_name | sort -r | head -n 1)
+  echo "$parent_dir/$latest"
+}
+
+get_cluster_master_public_hostname() {
+  aws emr describe-cluster --output json --cluster-id $1 | jq -r .Cluster.MasterPublicDnsName
+}
+
+expand_job_config() {
+  env=$1
+  job=$2
+  (get_s3_jobs_json ${env} ${job} || echo '{}') > "$ARGS_FILE"
+  action_list_tags ${env} | sed -e 's/^\([^ ]*\) *\(.*\)$/export \1="\2"/' > "$TAGS_ENV_FILE"
+  result=$(source "$TAGS_ENV_FILE" && envsubst < "$ARGS_FILE")
+  rm -f "$ARGS_FILE"
+  rm -f "$TAGS_ENV_FILE"
+  echo "$result"
+}
+
+expand_default_tags() {
+  env=$1
+  expand_job_config "$env" defaults
+}
+
+get_runner_args() {
+  job=$1 && shift
+  env=$(get_env)
+  jar=$(get_runner_jar)
+  jobClass=$(get_job_class)
+  args=$(get_args_as_list $(expand_job_config "$env" "$job"))
+  jobName=$(echo $job | sed -e 's/_.*$//')
+  echo "$jar $jobName $args $@"
+}
+
+get_tags_as_list() {
+  echo $(echo "$TAGS" | jq -r 'to_entries[] | [.key,.value] | @tsv' | tr '\t' '=')
+}
+
+show_tags_as_table() {
+  echo ${TAGS} | jq -r 'to_entries[] | [.key,.value] | @csv' | to_table
+}
+
+get_args_as_list() {
+  echo $(echo "$1" | jq -r 'to_entries[] | [.key,.value] | @tsv' | tr '\t' ' ' | sed -e 's/^/--/')
+}
+
+set_cluster_tags() {
+  TAGS=$(aws emr describe-cluster --output json --cluster-id $1 | jq -rc '.Cluster.Tags | from_entries')
+}
+
+get_default_cluster_id() {
+  aws emr list-clusters --output json --active | jq -r '.Clusters[]|.Id' | head -1
+}
+
+run_on_cluster() {
+  clusterId=$1 && shift
+  set_cluster_tags "$clusterId"
+  keyPair="~/.ssh/$(get_env)"
+  [ "$1" = "aws" ] && cmd="$@" || cmd="./${PROGRAM} $@"
+  echo "$cmd"
+  aws emr ssh --cluster-id "$clusterId" --key-pair-file "$keyPair" --command "$cmd" | grep -v '^ssh -o'
+}
+
+to_table() {
+  sed -e 's/01\/01\/1970 00:00/-/g' -e 's/12\/31\/1969 23:59:59/-/' | column -t -s, | sed -e 's/"//g'
+}
+
+########### ACTIONS ############
+
+action_ssh() {
+  ensure_local "ssh" && {
+    [ $# -eq 1 ] && {
+      set_cluster_tags $1
+      aws emr ssh --cluster-id $1 --key-pair-file "~/.ssh/$(get_env)"
+      return $?
+    } || echo "usage: ssh <cluster-id>"
+  }
+}
+
+action_list_clusters() {
+  arg=${1:-active}
+  aws emr list-clusters --output json --$arg | jq -r '["id","name","state","created","destroyed"], (.Clusters[] | [.Id, .Name, .Status.State, (.Status.Timeline.CreationDateTime|tonumber|strftime("%m/%d/%Y %H:%M")), (.Status.Timeline.EndDateTime+0|tonumber|strftime("%m/%d/%Y %H:%M"))]) | @csv' | to_table
+}
+
+is_cluster_id() {
+  echo $1 | grep -q '^[a-z]-[A-Z0-9]*$'
+}
+
+is_job_id() {
+  echo $1 | grep -q '^[a-z0-9]\{32\}$'
+}
+
+action_list_tags() {
+  ensure_ec2 && {
+    show_tags_as_table
+    return $?
+  }
+  [ $# -eq 1 ] && {
+    # if it looks like a cluster id...
+    is_cluster_id $1 && {
+      set_cluster_tags $1
+      show_tags_as_table
+      return $?
+    }
+    # else default env tags
+    TAGS="$(get_default_tags $1)"
+    show_tags_as_table
+    return $?
+  } || echo "usage: list-tags <cluster-id>|<env>"
+}
+
+action_bootstrap() {
+  ensure_ec2 && {
+    fv=$(get_flink_version)
+    tarball=$(get_tag FLINK_TARBALL)
+    ( aws s3 cp "$tarball" /tmp/flink.tgz && \
+      cd /usr/lib && \
+      sudo rm -rf flink && \
+      sudo tar xzf /tmp/flink.tgz && \
+      rm -f /tmp/flink.tgz && \
+      cd flink-${fv} && \
+      sudo cp opt/*.jar lib && \
+      sudo aws s3 cp "$(get_s3_bucket)/provision/lib" lib --recursive && \
+      sudo aws s3 sync --exclude "*.tgz" "$(get_s3_bucket)/provision/flink-$fv/" "./" && \
+      cd .. && \
+      sudo ln -s flink-${fv} flink && \
+      sudo mv -f /etc/flink/conf.dist /etc/flink/conf.dist.orig && \
+      sudo ln -s /usr/lib/flink/conf /etc/flink/conf.dist && \
+      echo "flink-$fv installed"
+    ) && action_download_jar
+    return $?
+  }
+  [ $# -eq 1 ] && {
+    run_on_cluster $1 aws s3 cp "${S3_BUCKET}/${PROGRAM}" . \&\& chmod +x ${PROGRAM} \&\& ./${PROGRAM} bootstrap
+  } || notice "usage: bootstrap <cluster-id>"
+}
+
+action_publish_jar() {
+  ensure_local "publish-jar" && {
+    [ $# -gt 0 ] && {
+      jar=$(basename $1)
+      aws s3 cp $1 "$(get_s3_bucket)/jars/$jar" && \
+        [ $# -gt 1 ] && run_on_cluster $2 download-jar "$jar"
+      return $?
+    } || notice "usage: publish-jar <jar-file> [cluster-id]"
+  }
+}
+
+action_download_jar() {
+  ensure_ec2 "download-jar" && {
+    jar=${1:-$(get_runner_jar)}
+    aws s3 cp "$(get_s3_bucket)/jars/$jar" .
+  }
+}
+
+action_publish_ctl() {
+  ensure_local "publish-ctl" && {
+    aws s3 cp ${PROGRAM} "$S3_BUCKET"
+    [ $# -gt 0 ] && {
+      run_on_cluster $1 aws s3 cp "$S3_BUCKET/${PROGRAM}" . \&\& chmod +x ${PROGRAM}
+      return $?
+    } || return 0
+  }
+}
+
+action_download_ctl() {
+  ensure_ec2 "download-ctl" && {
+    mv -f ${PROGRAM} "${PROGRAM}.old"
+    aws s3 cp "$S3_BUCKET/${PROGRAM}" .
+    chmod +x ${PROGRAM}
+  }
+}
+
+action_version() {
+  ensure_ec2 && {
+    echo ${VERSION}
+    return 0
+  }
+  [ $# -eq 1 ] && run_on_cluster $1 version || echo ${VERSION}
+}
+
+action_jar_version() {
+  ensure_ec2 && {
+    ${MD5_SUM} $(get_runner_jar)
+    return $?
+  }
+  [ $# -eq 1 ] && {
+    is_cluster_id $1 && run_on_cluster $1 jar-version || ${MD5_SUM} $1
+    return $?
+  } || notice "usage: jar-version <cluster-id>|<path-to-jar>"
+}
+
+
+action_start_cluster() {
+  ensure_local "start-cluster" && {
+    env=$1
+    [ "$#" = "2" ] && {
+      merge_tags $@
+      subnetId="subnet-$(get_subnet)"
+      aws emr create-cluster \
+        --release-label "$(get_release_label)" \
+        --instance-type "$(get_instance_type)" \
+        --instance-count "$(get_instance_count)" \
+        --name "$(get_cluster_name)" \
+        --log-uri "$(get_log_uri)" \
+        --use-default-roles \
+        --auto-scaling-role EMR_AutoScaling_DefaultRole \
+        --ec2-attributes "KeyName=$env,SubnetId=$subnetId" \
+        --termination-protected \
+        --visible-to-all-users \
+        --enable-debugging \
+        --tags $(get_tags_as_list) \
+        --applications Name=FLINK
+      return $?
+    } || {
+      echo
+      notice "usage: ${PROGRAM} start-cluster <env> <json-tags>"
+      echo
+      notice "  <env>       is the name of the environment to start the cluster in"
+      notice "  <json-tags> is a json string to override the default cluster tags "
+      notice "              for the environment (or add new ones). Current defaults:"
+      echo
+      action_list_tags "${env:-missing}"
+      echo
+    }
+  }
+}
+
+action_stop_cluster() {
+  ensure_local "stop-cluster" && {
+    [ $# -eq 1 ] && {
+      aws emr terminate-clusters --cluster-ids $1 && echo "Terminated"
+      return $?
+    } || notice "usage: stop-cluster <cluster-id>"
+  }
+}
+
+start_yarn() {
+  ensure_ec2 && \
+    flink-yarn-session -d -st -n $(get_num_tm) -s $(get_tm_slots) -jm $(get_jm_memory) -tm $(get_tm_memory)
+}
+
+action_stop_yarn() {
+  ensure_ec2 && {
+    local yid=$(get_yid)
+    [ "x$yid" = "x" ] || yarn application -kill ${yid}
+    return $?
+  }
+  [ $# -eq 1 ] && {
+    run_on_cluster $1 stop-yarn
+    return $?
+  } || notice "usage: stop-yarn <cluster-id>"
+}
+
+action_restart_yarn() {
+  ensure_ec2 && {
+    local yid=$(get_yid)
+    [ "x$yid" = "x" ] && start_yarn || (action_stop_yarn && start_yarn)
+    return $?
+  }
+  [ $# -eq 1 ] && {
+    run_on_cluster $1 restart-yarn
+    return $?
+  } || notice "usage: restart-yarn <cluster-id>"
+}
+
+action_run_job() {
+  ensure_ec2 && {
+    yid=$(get_yid)
+    [ "$yid" = "" ] && start_yarn
+
+    savepoint_path=""
+    with_savepoint=false
+
+    [ "$1" == "-s" ] && [ "$2" != "" ] && {
+      with_savepoint=true
+      savepoint_path=$2
+      shift && shift
+    }
+    job_name=$1
+
+    [ "$job_name" == "" ] && {
+      danger "ERROR: missing arguments."
+      return 1
+    }
+
+    [ "$with_savepoint" == true ] && {
+      [ "$savepoint_path" == "" ] && savepoint_path=latest
+
+      if [[ "$savepoint_path" == s3://* || "$savepoint_path" == hdfs://* ]]; then
+        savepoint_dir=$savepoint_path
+      elif [[ "$savepoint_path" == "latest" ]]; then
+        savepoint_dir=$(get_latest_savepoint_dir $job_name)
+      else
+        savepoint_dir=$(get_savepoint_parent_dir $job_name)/$savepoint_path
+      fi
+
+      notice "Checking savepoint: $savepoint_dir"
+      s3_exists=$(aws s3 ls "$savepoint_dir" &> /dev/null;echo $?)
+      [ $s3_exists -ne 0 ] && {
+        echo "ERROR: savepoint does not exists: $savepoint_dir"
+        return 1
+      }
+    }
+
+    flink_args=$(get_runner_args $@)
+    savepoint_option=""
+    [ "$with_savepoint" = true ] && savepoint_option="-s ${savepoint_dir}"
+    echo "flink run -d ${savepoint_option} ${flink_args}"
+    flink run -d ${savepoint_option} ${flink_args}
+    return $?
+  }
+  [ $# -ge 2 ] && is_cluster_id $1 && {
+    clusterId=$1 && shift
+    run_on_cluster "$clusterId" run $@
+    return $?
+  } || notice "usage: run <cluster-id> [-s <savepoint-path|latest>] <job-name> [job-args]"
+}
+
+action_cancel_job() {
+  ensure_ec2 && {
+    job_id=$1
+    savepoint_dir=""
+    with_savepoint=false
+
+    [ "$1" == "-s" ] && {
+      with_savepoint=true
+
+      is_job_id "$2" && {
+        job_id=$2
+      } || {
+        savepoint_dir=$2
+        job_id=$3
+      }
+    }
+
+    job_name=$(get_job_name_by_id $job_id)
+    [ "$job_name" == "" ] && {
+        danger "ERROR: no job_id found: $job_id"
+        return 1
+    }
+    [ "$with_savepoint" == true ] && [ "$savepoint_dir" == "" ] && {
+      savepoint_dir=$(get_savepoint_parent_dir $job_name)/$(date +%Y/%m/%d/%H%M%S)
+    }
+
+    savepoint_option=""
+    [ "$with_savepoint" = true ] && savepoint_option="-s ${savepoint_dir}"
+    notice "flink cancel ${savepoint_option} $job_id"
+    flink cancel ${savepoint_option} $job_id
+    return $?
+  }
+  [ $# -ge 2 ] && is_cluster_id $1 && {
+      clusterId=$1 && shift
+      run_on_cluster "$clusterId" cancel $@
+      return $?
+  } || notice "usage: cancel <cluster-id> [-s [savepoint-path]] <job-id>"
+}
+
+action_list_savepoints() {
+  ensure_ec2 && {
+    job_name=$1
+    echo
+    get_savepoint_id_list $job_name
+    echo
+    return 0
+  }
+  [ $# -eq 2 ] && {
+    clusterId=$1 && shift
+    run_on_cluster "$clusterId" list-savepoints $@
+    return $?
+  } || notice "usage: list-savepoints <cluster-id> <jobname>"
+
+}
+
+action_list_jobs() {
+  ensure_ec2 && {
+    echo
+  curl -s "$(get_flink_dashboard)/jobs/overview" | jq -r '["id","name","state","start","end"], (.jobs[] | [.jid,.name,.state,(.["start-time"]/1000|strftime("%m/%d/%Y %H:%M:%S")),(.["end-time"]+0|./1000|strftime("%m/%d/%Y %H:%M:S"))]) | @csv' | to_table
+    echo
+    return 0
+  }
+  [ $# -eq 1 ] && {
+    run_on_cluster $1 list-jobs
+    return $?
+  } || notice "usage: list-jobs <cluster-id>"
+}
+
+action_runner_status() {
+  ensure_ec2 && {
+    local yid=$(get_yid)
+    [ "x$yid" = "x" ] && warn "Yarn is not running...no jobs running" || {
+      echo 
+      notice "Yarn application is running: $yid"
+      notice "Flink dashboard url:         $(get_flink_dashboard)"
+      notice "Environment tags:"
+      action_list_tags
+      notice "Jobs:"
+      action_list_jobs
+      echo
+    }
+    return $?
+  }
+  [ $# -eq 1 ] && {
+    run_on_cluster $1 status
+    return $?
+  } || notice "usage: status <cluster-id>"
+}
+
+action_runner_help() {
+  ensure_local && sbt "run $1 help" 2>/dev/null || {
+    local jar=$(get_runner_jar)
+    flink run ${jar} $1 "help" 2>/dev/null | grep -v '\(INFO\|Hadoop\|YARN\)'
+  }
+}
+
+action_start_proxy() {
+  ensure_local "start-proxy" && {
+    [ $# -eq 1 ] && {
+      set_cluster_tags $1
+      notice "Attempting to open socks proxy on port 8157...disable with Ctrl-C"
+      aws emr socks --cluster-id $1 --key-pair-file "~/.ssh/$(get_env)"
+    } || notice "usage: start-proxy <cluster-id>"
+  }
+}
+
+action_publish_job_configs() {
+  ensure_local "publish-job-configs" && {
+    [ -d  ] && aws s3 sync jobs "$(get_s3_bucket)/jobs"
+  }
+}
+
+action_disable_tp() {
+  ensure_local "disable-tp" && {
+    [ $# -eq 1 ] && {
+      aws emr modify-cluster-attributes --cluster-id $1 --no-termination-protected && echo "ready to terminate"
+    } || notice "usage: disable-tp <cluster-id>"
+  }
+}
+
+action_enable_tp() {
+  ensure_local "enable-tp" && {
+    [ $# -eq 1 ] && {
+      aws emr modify-cluster-attributes --cluster-id $1 --termination-protected && echo "enabled termination protection"
+    } || notice "usage: enable-tp <cluster-id>"
+  }
+}
+
+usage() {
+  echo -e "usage: ${BWHI}$PROGRAM [command] [args]${RCOL}"
+  echo -e
+  echo -e "  A control script for managing ${BWHI}${RUNNER}${RCOL} on EMR clusters."
+  echo -e
+  echo -e "  Available Commands: (${GRE}D${RCOL}=dev only, ${BLU}E${RCOL}=EMR cluster only)"
+  echo -e 
+  echo -e "    ${BWHI}bootstrap${RCOL} <cluster-id>              run bootstrap command on emr cluster"
+  echo -e "    ${BWHI}cancel${RCOL} [cluster-id] [-s [savepoint-path]] <job-id>"
+  echo -e "                                            cancel a running job (by id)"
+  echo -e "                                            '-s' option triggers savepoint before job cancellation"
+  echo -e "    ${BWHI}help${RCOL}                                show this help screen"
+  echo -e "    ${BWHI}jar-version${RCOL} [cluster-id]            show the ${RUNNER} jar version"
+  echo -e "    ${BWHI}list-clusters${RCOL} [active|terminated]   list clusters"
+  echo -e "    ${BWHI}list-jobs${RCOL} [cluster-id]              list running jobs on EMR cluster"
+  echo -e "    ${BWHI}list-savepoints${RCOL} [cluster-id] <jobname>"
+  echo -e "                                           list savepoints of a ${RUNNER} job"
+  echo -e "    ${BWHI}list-tags${RCOL}                           list configured tags"
+  echo -e "    ${BWHI}list-tags${RCOL} [cluster-id|env]          list cluster or environment tags"
+  echo -e "    ${BWHI}restart-yarn${RCOL} [cluster-id]           restart yarn"
+  echo -e "    ${BWHI}${RUNNER}-help${RCOL} [jobname]            show ${RUNNER} help"
+  echo -e "    ${BWHI}run${RCOL} <cluster-id> [-s <savepoint-path|latest>] <job-name> [job-args]"
+  echo -e "                                           run a ${RUNNER} job"
+  echo -e "                                           '-s' option lets the job resume from the savepoint."
+  echo -e "    ${BWHI}start-yarn${RCOL} [cluster-id]             start yarn"
+  echo -e "    ${BWHI}status${RCOL} [cluster-id]                 show ${RUNNER} status"
+  echo -e "    ${BWHI}stop-yarn${RCOL}  [cluster-id]             stop yarn"
+  echo -e "    ${BWHI}version${RCOL} [cluster-id]                show fingerprint of this script"
+  echo -e
+  echo -e " ${GRE}D${RCOL}  ${BGRE}publish-ctl${RCOL} [<cluster-id>]          publish this script to s3 (and optionally to cluster)"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}publish-jar${RCOL} <jar-file> [cluster-id] publish ${RUNNER} jar to s3 (and optionally to cluster)"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}publish-job${RCOL}-configs                 publish job config files under ./jobs directory to s3"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}ssh-cluster${RCOL} <cluster-id>            ssh into a running EMR cluster"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}start-cluster${RCOL} <env> [json-tags]     start a new EMR cluster"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}start-proxy${RCOL} <cluster-id>            start an socks proxy to the cluster with ssh"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}stop-cluster${RCOL} <cluster-id>           stop a running EMR cluster"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}disable-tp${RCOL} <cluster-id>             disable termination protection for a cluster"
+  echo -e " ${GRE}D${RCOL}  ${BGRE}enable-tp${RCOL} <cluster-id>              enable termination protection for a cluster"
+  echo -e
+  echo -e " ${BLU}E${RCOL}  ${BBLU}download-ctl${RCOL}                        download this ctl script from s3"
+  echo -e " ${BLU}E${RCOL}  ${BBLU}download-jar${RCOL}                        download ${RUNNER} jar from s3"
+  echo -e "${RCOL}"
+}
+
+#ensure_ec2 && set_cluster_tags $(ec2-metadata -d | awk '{print $2}' | jq -r '.clusterId')
+ensure_ec2 && set_cluster_tags $(cat /mnt/var/lib/info/job-flow.json | jq -r '.jobFlowId')
+
+
+CMD=${1:-help}
+[ $# -gt 0 ] && shift
+
+case ${CMD} in
+
+  help)                usage                              ;;
+  version)             action_version $@                  ;;
+  jar-version)         action_jar_version $@              ;;
+  ${RUNNER}-help)      action_runner_help $@              ;;
+  status)              action_runner_status $@            ;;
+  start-cluster)       action_start_cluster $@            ;;
+  disable-tp)          action_disable_tp $@               ;;
+  enable-tp)           action_enable_tp $@                ;;
+  stop-cluster)        action_stop_cluster $@             ;;
+  ssh|ssh-cluster)     action_ssh $@                      ;;
+  list-clusters)       action_list_clusters $@            ;;
+  list-savepoints)     action_list_savepoints $@          ;;
+  list-tags)           action_list_tags $@                ;;
+  list-jobs)           action_list_jobs $@                ;;
+  start-proxy)         action_start_proxy $@              ;;
+  publish-ctl)         action_publish_ctl $@              ;;
+  publish-jar)         action_publish_jar $@              ;;
+  publish-job-configs) action_publish_job_configs         ;;
+  download-ctl)        action_download_ctl $@             ;;
+  download-jar)        action_download_jar $@             ;;
+  bootstrap)           action_bootstrap $@                ;;
+  start-yarn|restart-yarn)
+                       action_restart_yarn $@             ;;
+  stop-yarn)           action_stop_yarn $@                ;;
+  run)                 action_run_job $@                  ;;
+  cancel)              action_cancel_job $@               ;;
+  list-snapshots) 
+                       action_list_snapshots       $@     ;;
+
+  *)                   danger "ERROR: unknown command \"${CMD}\""
+                       echo
+                       usage
+esac
+[ $? -gt 0 ] && danger "[failure]"
+#EOF

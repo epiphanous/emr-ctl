@@ -1,0 +1,10 @@
+{
+  "ENV":                   "production",
+  "SUBNET":                "????????",
+  "FLINK_VERSION":         "1.7.2",
+  "FLINK_TARBALL":         "${S3_BUCKET}/provision/flink-${FLINK_VERSION}/flink-${FLINK_VERSION}-bin-hadoop28-scala_2.11.tgz",
+  "INSTANCE_COUNT":        "3",
+  "INSTANCE_TYPE":         "m5.2xlarge",
+  "LOG_URI":               "${S3_BUCKET}/logs/${ENV}",
+  "RELEASE_LABEL":         "emr-5.21.0",
+}

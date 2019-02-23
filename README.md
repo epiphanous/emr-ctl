@@ -1,4 +1,4 @@
-# emr-ctl
+# emr-ctl for flinkrunner applications
 
 Epiphanous' `emr-ctl` is a swiss-army knife command line utility
 that can be used to manage flink clusters running jobs written with
@@ -29,7 +29,7 @@ dev> ./emr-ctl
 
 The result is
 
-![doc/images/help-screen.png]
+![emr-ctl help screen](doc/images/help-screen.png)
 
 > Notice there is a warning emitted about a missing `AWS_PROFILE` environment
 > variable. This is only visible if you're in `dev` mode. `emr-ctl` relies

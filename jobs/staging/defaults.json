@@ -7,4 +7,5 @@
   "INSTANCE_TYPE":         "m5.2xlarge",
   "LOG_URI":               "${S3_BUCKET}/logs/${ENV}",
   "RELEASE_LABEL":         "emr-5.21.0",
+  "S3_BUCKET":             "s3://staging-artifacts"
 }

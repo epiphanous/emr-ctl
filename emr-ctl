@@ -428,7 +428,7 @@ action_start_cluster() {
         --log-uri "$(get_log_uri)" \
         --use-default-roles \
         --auto-scaling-role EMR_AutoScaling_DefaultRole \
-        --ec2-attributes "KeyName=$env,SubnetId=$subnetId" \
+        --ec2-attributes "KeyName=${RUNNER}-${env},SubnetId=${subnetId}" \
         --termination-protected \
         --visible-to-all-users \
         --enable-debugging \

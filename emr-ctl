@@ -275,10 +275,14 @@ get_default_cluster_id() {
   aws emr list-clusters --output json --active | jq -r '.Clusters[]|.Id' | head -1
 }
 
+get_key_pair() {
+  echo "~/.ssh/${RUNNER}-$(get_env)"
+}
+
 run_on_cluster() {
   clusterId=$1 && shift
   set_cluster_tags "$clusterId"
-  keyPair="~/.ssh/$(get_env)"
+  keyPair=$(get_key_pair)
   [ "$1" = "aws" ] && cmd="$@" || cmd="./${PROGRAM} $@"
   echo "$cmd"
   aws emr ssh --cluster-id "$clusterId" --key-pair-file "$keyPair" --command "$cmd" | grep -v '^ssh -o'
@@ -294,7 +298,7 @@ action_ssh() {
   ensure_local "ssh" && {
     [ $# -eq 1 ] && {
       set_cluster_tags $1
-      aws emr ssh --cluster-id $1 --key-pair-file "~/.ssh/$(get_env)"
+      aws emr ssh --cluster-id $1 --key-pair-file "$(get_key_pair)"
       return $?
     } || echo "usage: ssh <cluster-id>"
   }
@@ -428,7 +432,7 @@ action_start_cluster() {
         --log-uri "$(get_log_uri)" \
         --use-default-roles \
         --auto-scaling-role EMR_AutoScaling_DefaultRole \
-        --ec2-attributes "KeyName=${RUNNER}-${env},SubnetId=${subnetId}" \
+        --ec2-attributes "KeyName=$(get_key_pair),SubnetId=${subnetId}" \
         --termination-protected \
         --visible-to-all-users \
         --enable-debugging \
@@ -641,7 +645,7 @@ action_start_proxy() {
     [ $# -eq 1 ] && {
       set_cluster_tags $1
       notice "Attempting to open socks proxy on port 8157...disable with Ctrl-C"
-      aws emr socks --cluster-id $1 --key-pair-file "~/.ssh/$(get_env)"
+      aws emr socks --cluster-id $1 --key-pair-file "$(get_key_pair)"
     } || notice "usage: start-proxy <cluster-id>"
   }
 }

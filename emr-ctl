@@ -275,14 +275,18 @@ get_default_cluster_id() {
   aws emr list-clusters --output json --active | jq -r '.Clusters[]|.Id' | head -1
 }
 
-get_key_pair() {
-  echo "~/.ssh/${RUNNER}-$(get_env)"
+get_key_pair_name() {
+  echo "${RUNNER}-$(get_env)"
+}
+
+get_key_pair_file() {
+  echo "~/.ssh/$(get_key_pair_name)"
 }
 
 run_on_cluster() {
   clusterId=$1 && shift
   set_cluster_tags "$clusterId"
-  keyPair=$(get_key_pair)
+  keyPair=$(get_key_pair_file)
   [ "$1" = "aws" ] && cmd="$@" || cmd="./${PROGRAM} $@"
   echo "$cmd"
   aws emr ssh --cluster-id "$clusterId" --key-pair-file "$keyPair" --command "$cmd" | grep -v '^ssh -o'
@@ -298,7 +302,7 @@ action_ssh() {
   ensure_local "ssh" && {
     [ $# -eq 1 ] && {
       set_cluster_tags $1
-      aws emr ssh --cluster-id $1 --key-pair-file "$(get_key_pair)"
+      aws emr ssh --cluster-id $1 --key-pair-file "$(get_key_pair_file)"
       return $?
     } || echo "usage: ssh <cluster-id>"
   }
@@ -423,7 +427,9 @@ action_start_cluster() {
     env=$1
     [ "$#" = "2" ] && {
       merge_tags $@
-      subnetId="subnet-$(get_subnet)"
+      subnetIdAttr=""
+      subnet=$(get_subnet)
+      [ "$subnet" != "MISSING" ] && subnetIdAttr=",SubnetId=subnet-${subnet}"
       aws emr create-cluster \
         --release-label "$(get_release_label)" \
         --instance-type "$(get_instance_type)" \
@@ -432,7 +438,7 @@ action_start_cluster() {
         --log-uri "$(get_log_uri)" \
         --use-default-roles \
         --auto-scaling-role EMR_AutoScaling_DefaultRole \
-        --ec2-attributes "KeyName=$(get_key_pair),SubnetId=${subnetId}" \
+        --ec2-attributes "KeyName=$(get_key_pair_name)${subnetIdAttr}" \
         --termination-protected \
         --visible-to-all-users \
         --enable-debugging \
@@ -645,7 +651,7 @@ action_start_proxy() {
     [ $# -eq 1 ] && {
       set_cluster_tags $1
       notice "Attempting to open socks proxy on port 8157...disable with Ctrl-C"
-      aws emr socks --cluster-id $1 --key-pair-file "$(get_key_pair)"
+      aws emr socks --cluster-id $1 --key-pair-file "$(get_key_pair_file)"
     } || notice "usage: start-proxy <cluster-id>"
   }
 }

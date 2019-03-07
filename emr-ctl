@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-
 declare -r USER
 export AWS_PROFILE
 
 RUNNER="runner-???"
 RUNNER_VERSION="v?.??"
+S3_BUCKET="s3://emr-ctl-artifacts"
 
 # Colors
 RCOL='\e[0m'    # Text Reset
@@ -63,6 +63,9 @@ type aws >/dev/null 2>&1 || {
   exit 1
 }
 
+# pull in custom configuration
+source ./.env
+
 export AWS_DEFAULT_REGION=us-east-1
 
 PROGRAM=$(basename $0)
@@ -71,7 +74,6 @@ type md5 >/dev/null 2>&1 && MD5_SUM=md5
 
 VERSION=$(${MD5_SUM} $0)
 
-S3_BUCKET="s3://emr-ctl-artifacts"
 TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp/}${PROGRAM}.XXXXXXXXXXXX")
 TAGS_ENV_FILE="$TEMP_DIR/TAGS_ENV"
 ARGS_FILE="$TEMP_DIR/ARGS"
@@ -85,9 +87,6 @@ DEFAULT_TAG_JOB_MANAGER_MEMORY=4096
 DEFAULT_TAG_TASK_MANAGER_MEMORY=4096
 DEFAULT_TAG_SAVEPOINT_BASE=${S3_BUCKET}/flink-savepoints/default
 MISSING_TAG="MISSING"
-
-# pull in custom configuration
-source ./.env
 
 ensure_local() {
   cmd=$1
@@ -186,7 +185,7 @@ get_savepoint_base() {
 }
 
 get_runner_jar() {
-  echo "${RUNNER}-assembly-$(get_runner_version).jar"
+  echo "${RUNNER}-${RUNNER_VERSION}.jar"
 }
 
 get_subnet() {
